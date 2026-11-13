@@ -75,6 +75,7 @@ fn assistant_updates_stream_live_while_the_turn_runs() {
         telemetry_disabled: None,
         cron_store: None,
         queued_steering_probe: None,
+        orphan_journal_path: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -152,6 +153,7 @@ fn agent_engine_streams_updates_and_final_message() {
         telemetry_disabled: None,
         cron_store: None,
         queued_steering_probe: None,
+        orphan_journal_path: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -220,6 +222,7 @@ fn lazy_build_restores_only_the_pre_admission_prompt_context() {
         telemetry_disabled: None,
         cron_store: None,
         queued_steering_probe: None,
+        orphan_journal_path: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -404,6 +407,7 @@ fn a_busy_delivery_waits_for_the_run_and_drains_the_parked_row() {
         telemetry_disabled: None,
         cron_store: None,
         queued_steering_probe: Some(probe),
+        orphan_journal_path: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -583,6 +587,7 @@ fn two_parked_deliveries_elect_one_drainer_and_both_settle() {
         telemetry_disabled: None,
         cron_store: None,
         queued_steering_probe: Some(probe),
+        orphan_journal_path: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
@@ -779,6 +784,7 @@ fn two_parked_drainers_self_elect_instead_of_deadlocking_the_seat_wait() {
         telemetry_disabled: None,
         cron_store: None,
         queued_steering_probe: Some(probe),
+        orphan_journal_path: None,
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
