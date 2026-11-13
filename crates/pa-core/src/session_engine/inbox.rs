@@ -18,7 +18,10 @@ use serde_json::{json, Value};
 use crate::kernel::shared::{host_handler, HostRequestHandlers};
 
 use super::bash_notices::KernelNotice;
-use super::messages::{ASYNC_BASH_COMPLETION_CUSTOM_TYPE, FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE};
+use super::messages::{
+    ASYNC_BACKGROUND_CELL_COMPLETION_CUSTOM_TYPE, ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+    FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE,
+};
 use pa_types::ai::UserContent;
 use pa_types::session::CustomMessage;
 
@@ -49,6 +52,9 @@ pub const INBOX_CLASS_CHILD_EXITED: &str = "child-exited";
 pub const INBOX_CLASS_CHILD_FAILED: &str = "child-failed";
 /// The heartbeat class label: one fired scheduled heartbeat's prompt.
 pub const INBOX_CLASS_HEARTBEAT: &str = "heartbeat";
+/// The cell-done class label: one auto-backgrounded cell's completion
+/// (the `[cell-done ...]` row) routed into the inbox.
+pub const INBOX_CLASS_CELL_DONE: &str = "cell-done";
 
 /// The coalescing batch state the daemon's notice sink owns: the
 /// arrivals the currently queued short-notice row covers (reset when the
@@ -146,6 +152,7 @@ pub fn inbox_class_for_custom_type(custom_type: &str) -> Option<&'static str> {
     match custom_type {
         ASYNC_BASH_COMPLETION_CUSTOM_TYPE => Some(INBOX_CLASS_BASH_DONE),
         FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE => Some(INBOX_CLASS_FACTORY_PROGRESS),
+        ASYNC_BACKGROUND_CELL_COMPLETION_CUSTOM_TYPE => Some(INBOX_CLASS_CELL_DONE),
         _ => None,
     }
 }
@@ -176,6 +183,7 @@ pub fn inbox_notice_fields(notice: &KernelNotice) -> Option<InboxNotice> {
     let sender = match class {
         INBOX_CLASS_BASH_DONE => meta.get("command").and_then(Value::as_str),
         INBOX_CLASS_FACTORY_PROGRESS => meta.get("runId").and_then(Value::as_str),
+        INBOX_CLASS_CELL_DONE => meta.get("cellId").and_then(Value::as_str),
         _ => None,
     };
     Some(InboxNotice {
@@ -874,8 +882,24 @@ use pa_types::inbox_notice::{INBOX_NOTICE_CUSTOM_TYPE, INBOX_NOTICE_SENDER};
 /// text, so the turn's model context stays byte-identical to the
 /// plain-prompt delivery, while the details carry the inbox-system sender
 /// and the notice class for the transcript's own row class.
+///
+/// `wakes_cell` is the arrival's wake eligibility — whether the covered
+/// batch contained anything besides bare cell completions — and
+/// `covers_cell_done` is whether the batch contained a bare cell
+/// completion: both stored once at the row render. A later cell's wake
+/// predicate reads `wakes_cell` (a restored row without the bit is
+/// conservatively wakeable), and the quiescence observation reads
+/// `covers_cell_done` so a pending cell-done delivery is never reported
+/// as zero outstanding work (a restored row without the bit counts
+/// conservatively).
 #[must_use]
-pub fn create_inbox_notice_row(text: &str, class: &str, timestamp: u64) -> Value {
+pub fn create_inbox_notice_row(
+    text: &str,
+    class: &str,
+    wakes_cell: bool,
+    covers_cell_done: bool,
+    timestamp: u64,
+) -> Value {
     json!({
         "role": "custom",
         "customType": INBOX_NOTICE_CUSTOM_TYPE,
@@ -884,6 +908,8 @@ pub fn create_inbox_notice_row(text: &str, class: &str, timestamp: u64) -> Value
         "details": {
             "sender": INBOX_NOTICE_SENDER,
             "class": class,
+            "wakesCell": wakes_cell,
+            "coversCellDone": covers_cell_done,
         },
         "timestamp": timestamp,
     })
@@ -1830,11 +1856,12 @@ mod tests {
             "[inbox 14:03 UTC] 1 new message (bash-done); total waiting: 3. Read them with rlm.inbox.read(). {INBOX_PERSISTENCE_ERROR_CLAUSE}"
         );
         let reminder = format!("{} {INBOX_PERSISTENCE_ERROR_CLAUSE}", reminder_notice(3));
-        for (class, text) in [
-            (INBOX_NOTICE_CLASS_ARRIVAL, arrival),
-            (INBOX_NOTICE_CLASS_REMINDER, reminder),
+        for (class, text, covers_cell_done) in [
+            (INBOX_NOTICE_CLASS_ARRIVAL, arrival, true),
+            (INBOX_NOTICE_CLASS_REMINDER, reminder, false),
         ] {
-            let row = create_inbox_notice_row(&text, class, 1_730_000_000_000);
+            let row =
+                create_inbox_notice_row(&text, class, true, covers_cell_done, 1_730_000_000_000);
             // Whole-object equality: the exact wire shape, no extra keys,
             // every field present at once.
             let expected = json!({
@@ -1842,7 +1869,12 @@ mod tests {
                 "customType": INBOX_NOTICE_CUSTOM_TYPE,
                 "content": text.clone(),
                 "display": true,
-                "details": { "sender": INBOX_NOTICE_SENDER, "class": class },
+                "details": {
+                    "sender": INBOX_NOTICE_SENDER,
+                    "class": class,
+                    "wakesCell": true,
+                    "coversCellDone": covers_cell_done,
+                },
                 "timestamp": 1_730_000_000_000u64,
             });
             assert_eq!(row, expected, "the {class} notice row");

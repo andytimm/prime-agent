@@ -174,7 +174,14 @@ impl QueueHooks {
             |_, _| None,
             Some(engine.as_ref()),
         ) {
-            Ok(_queued) => true,
+            Ok(_queued) => {
+                // A steering fire ends a running cell's wait early, like
+                // any other steering arrival.
+                if lane == Lane::Steering {
+                    engine.fire_cell_wake();
+                }
+                true
+            }
             Err(_) => false,
         }
     }
