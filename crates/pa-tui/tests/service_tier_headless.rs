@@ -5,17 +5,15 @@
 #![cfg(unix)]
 #![warn(clippy::allow_attributes_without_reason)]
 
-mod support;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 
-use std::os::unix::net::UnixListener;
-
-use pa_tui::interactive::{HeadlessPlan, HeadlessStep, InteractiveOptions};
-use serde_json::{json, Value};
-
-use support::{
-    attach_response, create_response, detach_response, options, run_headless, serve_connection,
-    write_json, Request,
+use pa_tui::interactive::{
+    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, ModelSelection,
+    SessionSelection, UiMode,
 };
+use serde_json::{json, Value};
 
 struct MockSupervisor {
     listener: UnixListener,
@@ -49,21 +47,67 @@ impl MockSupervisor {
 
     /// Serve one connection: attach an OpenRouter-model session; `set_service_tier` applies,
     /// `get_state` reports the tier.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mock daemon request loop: one match arm per scripted request method"
+    )]
     fn serve(self) {
         let (stream, _) = self.listener.accept().expect("accept");
-        serve_connection(stream, &[], |writer, Request { id, kind, .. }| {
-            match kind {
+        let write_stream = stream.try_clone().expect("clone mock socket");
+        let mut writer = write_stream;
+        let mut reader = BufReader::new(stream);
+
+        let hello = json!({
+            "type": "daemon_hello",
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "serverCapabilities": [],
+            "clientId": "mock",
+        });
+        write_json(&mut writer, &hello);
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(envelope) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            let id = envelope.get("id").and_then(Value::as_str).unwrap_or("");
+            let command = envelope.get("command").cloned().unwrap_or(Value::Null);
+            let command_type = command
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            match command_type.as_str() {
                 "create" => {
-                    write_json(writer, &create_response(id));
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "create",
+                            "success": true,
+                            "data": {
+                                "activeSessionId": "s1",
+                                "id": "s1",
+                                "sessionId": "sess-1",
+                                "sessionFile": "/tmp/sess-1.jsonl",
+                            },
+                        }),
+                    );
                 }
                 "attach" => {
-                    write_json(writer, &attach_data(id));
+                    write_json(&mut writer, &attach_data(id));
                 }
                 "set_service_tier" => {
                     // The daemon arm answers success with no data; the follow-up get_state read
                     // reports the applied tier.
                     write_json(
-                        writer,
+                        &mut writer,
                         &json!({
                             "type": "response",
                             "id": id,
@@ -78,7 +122,7 @@ impl MockSupervisor {
                     // composition-root catalog; serve the same OpenRouter entry the eligibility
                     // reads run against.
                     write_json(
-                        writer,
+                        &mut writer,
                         &json!({
                             "type": "response",
                             "id": id,
@@ -93,7 +137,7 @@ impl MockSupervisor {
                 }
                 "get_connection_state" => {
                     write_json(
-                        writer,
+                        &mut writer,
                         &json!({
                             "type": "response",
                             "id": id,
@@ -111,22 +155,73 @@ impl MockSupervisor {
                     );
                 }
                 "detach" => {
-                    write_json(writer, &detach_response(id));
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "detach",
+                            "success": true,
+                        }),
+                    );
                 }
-                _ => return false,
+                _ => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": command_type,
+                            "success": true,
+                            "data": {},
+                        }),
+                    );
+                }
             }
-            true
-        });
+        }
     }
+}
+
+fn write_json(writer: &mut UnixStream, value: &Value) {
+    let mut line = serde_json::to_string(value).expect("serialize mock frame");
+    line.push('\n');
+    writer.write_all(line.as_bytes()).expect("write mock frame");
+    writer.flush().expect("flush mock frame");
 }
 
 /// The slim attach result: one session on an `OpenRouter` completions model (the catalog entry the
 /// eligibility predicate reads).
 fn attach_data(id: &str) -> Value {
-    let mut response = attach_response(id, "tier session");
-    response["data"]["snapshot"]["state"]["model"] =
-        json!({ "id": "openai/gpt-5.5", "provider": "openrouter" });
-    response
+    json!({
+        "type": "response",
+        "id": id,
+        "command": "attach",
+        "success": true,
+        "data": {
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "activeSessionId": "s1",
+            "snapshot": {
+                "activeSessionId": "s1",
+                "summary": { "id": "s1", "cwd": "/tmp" },
+                "state": {
+                    "activeSessionId": "s1",
+                    "cwd": "/tmp",
+                    "sessionId": "sess-1",
+                    "sessionName": "tier session",
+                    "model": { "id": "openai/gpt-5.5", "provider": "openrouter" },
+                    "isStreaming": false,
+                    "isCompacting": false,
+                    "sessionActions": { "queuedCount": 0, "steering": [], "followUps": [] },
+                },
+                "messages": [],
+                "lastEventSequence": 0,
+                "lastEventCursor": null,
+            },
+            "client": { "id": "mock", "capabilities": [] },
+            "lastEventSequence": 0,
+            "lastEventCursor": null,
+        },
+    })
 }
 
 /// The composition-root catalog seed (the options snapshot).
@@ -136,22 +231,64 @@ fn openrouter_catalog() -> Vec<pa_types::ai::Model> {
         .expect("catalog model")
 }
 
+fn options(socket: PathBuf) -> InteractiveOptions {
+    InteractiveOptions {
+        models: None,
+        socket_path: socket,
+        cwd: PathBuf::from("/tmp"),
+        session_dir: None,
+        script_path: None,
+        model_selection: ModelSelection::default(),
+        model_catalog: openrouter_catalog(),
+        model_configured_providers: std::collections::HashSet::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: SessionSelection::New,
+        restore_dock_focus: false,
+        initial_message: None,
+        show_images: true,
+        fullscreen_mouse: true,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        traces: None,
+        provider_auth: None,
+        update_commands: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        prompt_stash: std::sync::Arc::default(),
+        session_has_children: false,
+        client_settings: None,
+    }
+}
+
 fn run_plan(steps: Vec<HeadlessStep>) -> Vec<String> {
-    let outcome = run_headless(
-        HeadlessPlan {
-            steps,
-            width: 100,
-            height: 30,
-        },
-        |socket| InteractiveOptions {
-            model_catalog: openrouter_catalog(),
-            ..options(socket)
-        },
-        |socket| {
-            let supervisor = MockSupervisor::bind(socket);
-            move || supervisor.serve()
-        },
-    );
+    std::env::remove_var("TMUX");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("tui.sock");
+    let supervisor = MockSupervisor::bind(&socket);
+    let handle = std::thread::spawn(move || supervisor.serve());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let plan = HeadlessPlan {
+        steps,
+        width: 100,
+        height: 30,
+    };
+    let outcome = runtime
+        .block_on(run_interactive(options(socket), UiMode::Headless(plan)))
+        .expect("interactive run");
+    handle.join().expect("mock supervisor finished");
     outcome.frames
 }
 

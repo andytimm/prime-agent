@@ -36,20 +36,17 @@
 //   removals would ripple through the callers without changing behavior.
 #![allow(clippy::unnecessary_wraps)]
 
-mod support;
-
-use std::os::unix::net::UnixListener;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use pa_tui::interactive::{HeadlessPlan, HeadlessStep, InteractiveOptions};
-use serde_json::{json, Value};
-
-use support::{
-    attach_response, create_response, detach_response, run_headless, serve_connection,
-    session_stats_response, write_json, Request,
+use pa_tui::interactive::{
+    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, ModelSelection,
+    SessionSelection, UiMode,
 };
+use serde_json::{json, Value};
 
 struct MockSupervisor {
     listener: UnixListener,
@@ -90,99 +87,242 @@ impl MockSupervisor {
             factory_graph_error,
         } = self;
         let (stream, _) = listener.accept().expect("accept");
-        let capabilities: Vec<&str> = server_capabilities.iter().map(String::as_str).collect();
+        let write_stream = stream.try_clone().expect("clone mock socket");
+        let mut writer = write_stream;
+        let mut reader = BufReader::new(stream);
+
+        let hello = json!({
+            "type": "daemon_hello",
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "serverCapabilities": server_capabilities,
+            "clientId": "mock",
+        });
+        write_json(&mut writer, &hello);
+
         // A page stop also stops the mock's session: the daemon's `session_closed` follows the
         // stop's reply, and the closed session's graph lane answers a refusal from then on.
         let mut session_closed = false;
-        serve_connection(
-            stream,
-            &capabilities,
-            |writer, Request { id, kind, command }| {
-                match kind {
-                    "create" => {
-                        write_json(writer, &create_response(id));
-                    }
-                    "attach" => {
-                        write_json(writer, &attach_response(id, "factory session"));
-                    }
-                    "get_session_stats" => {
-                        write_json(writer, &session_stats_response(id));
-                    }
-                    "detach" => {
-                        write_json(writer, &detach_response(id));
-                    }
-                    "factory_activity" => {
-                        // The lane's mock: a graph action answers the
-                        // configured refusal (the worker arm's exact
-                        // kernel-not-running wire shape) or the configured
-                        // runs reply; every other action answers empty data
-                        // (the guard reads the graph list only).
-                        if command.get("action").and_then(Value::as_str) == Some("stop") {
-                            write_json(
-                                writer,
-                                &json!({
-                                    "type": "response",
-                                    "id": id,
-                                    "command": "factory_activity",
-                                    "success": true,
-                                    "data": { "state": "stopping" },
-                                }),
-                            );
-                            write_json(
-                                writer,
-                                &json!({
-                                    "type": "session_closed",
-                                    "activeSessionId": "s1",
-                                    "reason": "killed",
-                                }),
-                            );
-                            session_closed = true;
-                            return true;
-                        }
-                        if command.get("action").and_then(Value::as_str) == Some("graph") {
-                            let error = if session_closed {
-                                Some("Unknown active session: s1".to_string())
-                            } else {
-                                factory_graph_error.clone()
-                            };
-                            if let Some(error) = error.as_ref() {
-                                write_json(
-                                    writer,
-                                    &json!({
-                                        "type": "response",
-                                        "id": id,
-                                        "command": "factory_activity",
-                                        "success": false,
-                                        "error": error,
-                                    }),
-                                );
-                                return true;
-                            }
-                        }
-                        let data = match (
-                            factory_graph.as_ref(),
-                            command.get("action").and_then(Value::as_str),
-                        ) {
-                            (Some(runs), Some("graph")) => runs.clone(),
-                            _ => json!({}),
-                        };
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(envelope) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            let id = envelope.get("id").and_then(Value::as_str).unwrap_or("");
+            let command = envelope.get("command").cloned().unwrap_or(Value::Null);
+            let command_type = command
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            match command_type.as_str() {
+                "create" => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "create",
+                            "success": true,
+                            "data": {
+                                "activeSessionId": "s1",
+                                "id": "s1",
+                                "sessionId": "sess-1",
+                                "sessionFile": "/tmp/sess-1.jsonl",
+                            },
+                        }),
+                    );
+                }
+                "attach" => {
+                    write_json(&mut writer, &attach_data(id));
+                }
+                "get_session_stats" => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "get_session_stats",
+                            "success": true,
+                            "data": {
+                                "contextUsage": { "tokens": 1200, "contextWindow": 200_000 },
+                                "cost": 0.01,
+                            },
+                        }),
+                    );
+                }
+                "detach" => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "detach",
+                            "success": true,
+                        }),
+                    );
+                }
+                "factory_activity" => {
+                    // The lane's mock: a graph action answers the
+                    // configured refusal (the worker arm's exact
+                    // kernel-not-running wire shape) or the configured
+                    // runs reply; the overview action answers the same
+                    // configured runs owned by the attached session (the
+                    // page's all-session lane in this battery); every other
+                    // action answers empty data (the guard reads the graph
+                    // list only).
+                    if command.get("action").and_then(Value::as_str) == Some("stop") {
                         write_json(
-                            writer,
+                            &mut writer,
                             &json!({
                                 "type": "response",
                                 "id": id,
                                 "command": "factory_activity",
                                 "success": true,
-                                "data": data,
+                                "data": { "state": "stopping" },
                             }),
                         );
+                        write_json(
+                            &mut writer,
+                            &json!({
+                                "type": "session_closed",
+                                "activeSessionId": "s1",
+                                "reason": "killed",
+                            }),
+                        );
+                        session_closed = true;
+                        continue;
                     }
-                    _ => return false,
+                    if command.get("action").and_then(Value::as_str) == Some("graph") {
+                        let error = if session_closed {
+                            Some("Unknown active session: s1".to_string())
+                        } else {
+                            factory_graph_error.clone()
+                        };
+                        if let Some(error) = error.as_ref() {
+                            write_json(
+                                &mut writer,
+                                &json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "command": "factory_activity",
+                                    "success": false,
+                                    "error": error,
+                                }),
+                            );
+                            continue;
+                        }
+                    }
+                    let data = match (
+                        factory_graph.as_ref(),
+                        command.get("action").and_then(Value::as_str),
+                    ) {
+                        (Some(runs), Some("graph")) => runs.clone(),
+                        // The page's overview lane: the same configured
+                        // runs, owned by the attached session (`sess-1`), so
+                        // the page's rows and its owned drill-in behave
+                        // exactly as they did on the scoped graph.
+                        (Some(runs), Some("overview")) => {
+                            let owned: Vec<Value> = runs
+                                .get("runs")
+                                .and_then(Value::as_array)
+                                .map(|rows| {
+                                    rows.iter()
+                                        .cloned()
+                                        .map(|mut row| {
+                                            if let Some(object) = row.as_object_mut() {
+                                                object
+                                                    .insert("ownerId".to_string(), json!("sess-1"));
+                                                object.insert("ownerName".to_string(), json!(""));
+                                                object.insert("saved".to_string(), json!(false));
+                                                // The daemon's live-cache rows carry the
+                                                // peek lane's `armed` marker (null for an
+                                                // executing run): the page routes an
+                                                // owned row's Enter by it.
+                                                object.insert("armed".to_string(), json!(null));
+                                            }
+                                            row
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            json!({ "runs": owned, "warnings": [] })
+                        }
+                        // The factory page's machine list: an empty library.
+                        (_, Some("library")) => json!({"machines": [], "warnings": []}),
+                        _ => json!({}),
+                    };
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "factory_activity",
+                            "success": true,
+                            "data": data,
+                        }),
+                    );
                 }
-                true
-            },
-        );
+                _ => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": command_type,
+                            "success": true,
+                            "data": {},
+                        }),
+                    );
+                }
+            }
+        }
     }
+}
+
+fn write_json(writer: &mut UnixStream, value: &Value) {
+    let mut line = serde_json::to_string(value).expect("serialize mock frame");
+    line.push('\n');
+    writer.write_all(line.as_bytes()).expect("write mock frame");
+    writer.flush().expect("flush mock frame");
+}
+
+/// The slim attach result: one empty session.
+fn attach_data(id: &str) -> Value {
+    json!({
+        "type": "response",
+        "id": id,
+        "command": "attach",
+        "success": true,
+        "data": {
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "activeSessionId": "s1",
+            "snapshot": {
+                "activeSessionId": "s1",
+                "summary": { "id": "s1", "cwd": "/tmp" },
+                "state": {
+                    "activeSessionId": "s1",
+                    "cwd": "/tmp",
+                    "sessionId": "sess-1",
+                    "sessionName": "factory session",
+                    "model": null,
+                    "isStreaming": false,
+                    "isCompacting": false,
+                    "sessionActions": { "queuedCount": 0, "steering": [], "followUps": [] },
+                },
+                "messages": [],
+                "lastEventSequence": 0,
+                "lastEventCursor": null,
+            },
+            "client": { "id": "mock", "capabilities": [] },
+            "lastEventSequence": 0,
+            "lastEventCursor": null,
+        },
+    })
 }
 
 /// A minimal settings seam for the harness: the factory gate reads and
@@ -338,8 +478,39 @@ impl pa_tui::client_settings::ClientSettings for RecordingSettings {
 
 fn options(socket: PathBuf) -> InteractiveOptions {
     InteractiveOptions {
+        models: None,
+        socket_path: socket,
+        cwd: PathBuf::from("/tmp"),
+        session_dir: None,
+        script_path: None,
+        model_selection: ModelSelection::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: std::collections::HashSet::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: SessionSelection::New,
+        initial_message: None,
+        show_images: true,
+        fullscreen_mouse: true,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        traces: None,
+        provider_auth: None,
+        update_commands: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        prompt_stash: std::sync::Arc::default(),
+        session_has_children: false,
+        restore_dock_focus: false,
         client_settings: Some(std::sync::Arc::new(RecordingSettings::default())),
-        ..support::options(socket)
     }
 }
 
@@ -366,23 +537,30 @@ fn run_plan_config_with_graph_error(
     factory_graph_error: Option<String>,
     steps: Vec<HeadlessStep>,
 ) -> Vec<String> {
-    let outcome = run_headless(
-        HeadlessPlan {
-            steps,
-            width: 100,
-            height: 30,
-        },
-        options,
-        |socket| {
-            let supervisor = MockSupervisor::bind_with(
-                socket,
-                server_capabilities,
-                factory_graph,
-                factory_graph_error,
-            );
-            move || supervisor.serve()
-        },
+    std::env::remove_var("TMUX");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("tui.sock");
+    let supervisor = MockSupervisor::bind_with(
+        &socket,
+        server_capabilities,
+        factory_graph,
+        factory_graph_error,
     );
+    let handle = std::thread::spawn(move || supervisor.serve());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let plan = HeadlessPlan {
+        steps,
+        width: 100,
+        height: 30,
+    };
+    let outcome = runtime
+        .block_on(run_interactive(options(socket), UiMode::Headless(plan)))
+        .expect("interactive run");
+    handle.join().expect("mock supervisor finished");
     outcome.frames
 }
 
@@ -444,7 +622,7 @@ fn factory_on_and_off_round_trip_the_gate_through_the_seam() {
     let all = flat_text(&frames);
     assert!(
         all.contains(
-            "The factory is enabled. Restart the client to surface the factory group (the factory page and the agent-side factory API follow the same gate)."
+            "The factory is enabled. Restart the client to surface the machines group (the machines page and the agent-side factory API follow the same gate)."
         ),
         "the enabled note rendered:\n{all}"
     );
@@ -454,7 +632,7 @@ fn factory_on_and_off_round_trip_the_gate_through_the_seam() {
     );
     assert!(
         all.contains(
-            "The factory is disabled. The factory group and page disappear on the next client start."
+            "The factory is disabled. The machines group and page disappear on the next client start."
         ),
         "the off note rendered:\n{all}"
     );
@@ -515,7 +693,7 @@ fn factory_off_refuses_while_runs_are_live() {
     let all = flat_text(&frames);
     assert!(
         all.contains(
-            "Cannot disable the factory while 2 runs are still live — stop them first (the factory page's stop action or rlm.factory.stop), then /factory off."
+            "Cannot disable the factory while 2 runs are still live — stop them first (the run page's stop action or rlm.factory.stop), then /factory off."
         ),
         "the refusal names the live count:\n{all}"
     );
@@ -524,7 +702,7 @@ fn factory_off_refuses_while_runs_are_live() {
         "the gate stayed enabled after the refused off:\n{all}"
     );
     assert!(
-        !all.contains("The factory is disabled. The factory group and page disappear on the next client start."),
+        !all.contains("The factory is disabled. The machines group and page disappear on the next client start."),
         "the off note never rendered:\n{all}"
     );
 }
@@ -548,7 +726,7 @@ fn factory_off_proceeds_once_no_runs_are_live() {
     let frames = run_plan_config(vec!["factory_activity".to_string()], Some(graph), steps);
     let all = flat_text(&frames);
     assert!(
-        all.contains("The factory is disabled. The factory group and page disappear on the next client start."),
+        all.contains("The factory is disabled. The machines group and page disappear on the next client start."),
         "the off proceeded with only terminal runs:\n{all}"
     );
     assert!(
@@ -579,7 +757,7 @@ fn factory_off_refuses_on_a_client_whose_hello_predates_the_gate() {
     let all = flat_text(&frames);
     assert!(
         all.contains(
-            "Cannot disable the factory while 1 run is still live — stop it first (the factory page's stop action or rlm.factory.stop), then /factory off."
+            "Cannot disable the factory while 1 run is still live — stop it first (the run page's stop action or rlm.factory.stop), then /factory off."
         ),
         "the unadvertised-lane guard still refused:\n{all}"
     );
@@ -603,7 +781,7 @@ fn factory_off_proceeds_when_the_lane_cannot_report() {
     let frames = run_plan_config(Vec::new(), None, steps);
     let all = flat_text(&frames);
     assert!(
-        all.contains("The factory is disabled. The factory group and page disappear on the next client start."),
+        all.contains("The factory is disabled. The machines group and page disappear on the next client start."),
         "the unreadable count never blocked off:\n{all}"
     );
     assert!(
@@ -669,7 +847,7 @@ fn factory_off_proceeds_when_the_kernel_is_not_running() {
     );
     let all = flat_text(&frames);
     assert!(
-        all.contains("The factory is disabled. The factory group and page disappear on the next client start."),
+        all.contains("The factory is disabled. The machines group and page disappear on the next client start."),
         "the no-kernel count never blocked off:\n{all}"
     );
     assert!(
@@ -683,7 +861,10 @@ fn factory_off_proceeds_when_the_kernel_is_not_running() {
 }
 
 /// One live named run row for the page battery (the wire shape the
-/// kernel's graph lane sends): the name the panel header paints.
+/// kernel's graph lane sends): the name the panel header paints. The
+/// machine is a minimal valid one-state machine — the run page renders
+/// its diagram, and a zero-state machine is loader-invalid (the
+/// factory directory rejects it).
 fn factory_page_run(id: &str, name: &str) -> Value {
     json!({
         "runId": id,
@@ -691,7 +872,7 @@ fn factory_page_run(id: &str, name: &str) -> Value {
         "name": name,
         "state": "running",
         "elapsedMs": 100,
-        "machine": { "states": [], "transitions": [] },
+        "machine": { "states": [ { "id": "entry", "entry": true } ], "transitions": [] },
         "nodes": [],
         "usage": { "running": 0 },
     })
@@ -727,16 +908,18 @@ fn escape() -> KeyEvent {
 /// dispatched input paints — the same TS `handleInput` parity that
 /// carries the dock's keys and every other picker key). The pin closes
 /// the page on the input right after the arrow, so no poll window can
-/// sit between the move and the paint: the moved selection marker must
-/// land in a captured frame on the arrow's own repaint — and the poll
-/// alone could never produce it, because a fold preserves the selected
-/// run id, so a picker key that skipped its repaint would leave the
-/// marker on the old run forever (the fold repaints the same unmoved
-/// selection).
+/// sit between the move and the paint: the moved selection's box frame
+/// must land in a captured frame on the arrow's own repaint — and the
+/// poll alone could never produce it, because a fold preserves the
+/// selected row, so a picker key that skipped its repaint would leave
+/// the frame on the old row forever (the fold repaints the same
+/// unmoved selection).
 #[test]
 fn factory_page_picker_keys_paint_the_moved_selection_on_the_key() {
-    // Oldest first on the wire; the page reads newest-first, so
-    // second-run is the opening selection and first-run is one Down away.
+    // Oldest first on the wire (the reply's start order): the machines
+    // page lists the runs in the reply's order and anchors on the first
+    // row, so first-run is the opening selection and Enter opens its run
+    // page.
     let graph = json!({
         "runs": [
             factory_page_run("run-old", "first-run"),
@@ -751,15 +934,22 @@ fn factory_page_picker_keys_paint_the_moved_selection_on_the_key() {
         HeadlessStep::Key(down()),
         HeadlessStep::Key(down()),
         HeadlessStep::Key(enter()),
-        // The page opens on the feed's live head: the newest run.
+        // The machines page lists the runs in the reply's order; the
+        // anchored marker sits on the first row, and Enter opens that
+        // row's run page.
         HeadlessStep::WaitRender {
-            needle: "factory: second-run".to_string(),
+            needle: "\u{25b8} \u{21b3} first-run".to_string(),
             timeout_ms: 5_000,
         },
-        // Down moves the selection to the older run, and Esc closes the
-        // page on the very next input — no poll cycle can land between
-        // the two, so the moved marker below can only be the arrow's own
-        // repaint.
+        HeadlessStep::Key(enter()),
+        HeadlessStep::WaitRender {
+            needle: "run: first-run".to_string(),
+            timeout_ms: 5_000,
+        },
+        // Down moves the selection onto the run's state row, and Esc
+        // closes the page on the very next input — no poll cycle can
+        // land between the two, so the moved frame below can only be
+        // the arrow's own repaint.
         HeadlessStep::Key(down()),
         HeadlessStep::Key(escape()),
         HeadlessStep::WaitMs(200),
@@ -767,53 +957,20 @@ fn factory_page_picker_keys_paint_the_moved_selection_on_the_key() {
     let frames = run_plan_config(vec!["factory_activity".to_string()], Some(graph), steps);
     let all = flat_text(&frames);
     assert!(
-        all.contains("factory: second-run"),
-        "the page mounted on the newest run:\n{all}"
+        all.contains("run: first-run"),
+        "the page mounted on the anchored run:\n{all}"
     );
     assert!(
-        all.contains("\u{25b8} factory: first-run"),
+        all.contains("\u{2503} entry"),
         "the arrow's own repaint painted the moved selection before the page closed:\n{all}"
     );
 }
 
-/// A paste while the factory page owns the frame never lands in the editor hidden behind it: the
-/// page has no text input, so it consumes the paste like the other input-less frame owners.
-#[test]
-fn a_paste_on_the_factory_page_stays_out_of_the_hidden_editor() {
-    let graph = json!({ "runs": [factory_page_run("run-1", "only-run")] });
-    let steps = vec![
-        HeadlessStep::Key(alt_a()),
-        HeadlessStep::Key(down()),
-        HeadlessStep::Key(down()),
-        HeadlessStep::Key(down()),
-        HeadlessStep::Key(enter()),
-        HeadlessStep::WaitRender {
-            needle: "factory: only-run".to_string(),
-            timeout_ms: 5_000,
-        },
-        HeadlessStep::Paste("zq-stray-paste".to_string()),
-        HeadlessStep::Key(escape()),
-        HeadlessStep::WaitGone {
-            needle: "factory: only-run".to_string(),
-            timeout_ms: 5_000,
-        },
-    ];
-    let frames = run_plan_config(vec!["factory_activity".to_string()], Some(graph), steps);
-    let all = flat_text(&frames);
-    assert!(
-        all.contains("factory: only-run"),
-        "the page mounted before the paste:\n{all}"
-    );
-    assert!(
-        !all.contains("zq-stray-paste"),
-        "the paste must not reach the editor behind the page:\n{all}"
-    );
-}
-
 /// A session the daemon stops while its factory page is open leaves no stale run cards: the
-/// close clears the dock's run cache and the mounted page with it.
+/// close clears the dock's run cache and the mounted run page with it (the machine page's
+/// all-session rows are not the closed session's cache; they stay).
 #[test]
-fn a_closed_session_clears_the_open_factory_page() {
+fn a_closed_session_clears_the_run_cards_and_the_run_page() {
     let graph = json!({ "runs": [factory_page_run("run-1", "only-run")] });
     let steps = vec![
         HeadlessStep::Key(alt_a()),
@@ -822,7 +979,12 @@ fn a_closed_session_clears_the_open_factory_page() {
         HeadlessStep::Key(down()),
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitRender {
-            needle: "factory: only-run".to_string(),
+            needle: "\u{21b3} only-run".to_string(),
+            timeout_ms: 5_000,
+        },
+        HeadlessStep::Key(enter()),
+        HeadlessStep::WaitRender {
+            needle: "run: only-run".to_string(),
             timeout_ms: 5_000,
         },
         // The first stop press arms the selected run, the second stops it; the mock's daemon

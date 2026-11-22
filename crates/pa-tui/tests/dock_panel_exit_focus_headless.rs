@@ -6,21 +6,16 @@
 #![cfg(unix)]
 #![warn(clippy::allow_attributes_without_reason)]
 
-mod support;
-
-use std::os::unix::net::UnixListener;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pa_tui::interactive::{
     run_interactive, run_interactive_agents_view_open, HeadlessPlan, HeadlessStep,
-    InteractiveOutcome, SessionPanel, UiMode,
+    InteractiveOptions, InteractiveOutcome, ModelSelection, SessionPanel, SessionSelection, UiMode,
 };
 use serde_json::{json, Value};
-
-use support::{
-    attach_response, create_response, detach_response, options, serve_connection,
-    session_stats_response, write_json, Request,
-};
 
 struct MockSupervisor {
     listener: UnixListener,
@@ -38,25 +33,71 @@ impl MockSupervisor {
 
     /// Serve one connection: attach the session with the goal state, then answer the loop's
     /// requests.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mock daemon request loop: one match arm per scripted request method"
+    )]
     fn serve(self) {
         let (stream, _) = self.listener.accept().expect("accept");
+        let write_stream = stream.try_clone().expect("clone mock socket");
+        let mut writer = write_stream;
+        let mut reader = BufReader::new(stream);
+
         // The hello advertises the kernel-bash activity capability: the registry poll is
         // capability-gated (the dock and the shells view stay empty without it).
         let mut capabilities = vec!["kernel_bash_activity"];
         if self.factory_graph.is_some() {
             capabilities.push("factory_activity");
         }
-        serve_connection(stream, &capabilities, |writer, Request { id, kind, .. }| {
-            match kind {
+        let hello = json!({
+            "type": "daemon_hello",
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "serverCapabilities": capabilities,
+            "clientId": "mock",
+        });
+        write_json(&mut writer, &hello);
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(envelope) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            let id = envelope.get("id").and_then(Value::as_str).unwrap_or("");
+            let command = envelope.get("command").cloned().unwrap_or(Value::Null);
+            let command_type = command
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            match command_type.as_str() {
                 "create" => {
-                    write_json(writer, &create_response(id));
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "create",
+                            "success": true,
+                            "data": {
+                                "activeSessionId": "s1",
+                                "id": "s1",
+                                "sessionId": "sess-1",
+                                "sessionFile": "/tmp/sess-1.jsonl",
+                            },
+                        }),
+                    );
                 }
                 "attach" => {
-                    write_json(writer, &attach_data(id));
+                    write_json(&mut writer, &attach_data(id));
                 }
                 "heartbeats_list" => {
                     write_json(
-                        writer,
+                        &mut writer,
                         &json!({
                             "type": "response",
                             "id": id,
@@ -85,7 +126,7 @@ impl MockSupervisor {
                 }
                 "list_kernel_bash" => {
                     write_json(
-                        writer,
+                        &mut writer,
                         &json!({
                             "type": "response",
                             "id": id,
@@ -101,7 +142,7 @@ impl MockSupervisor {
                 }
                 "factory_activity" => {
                     write_json(
-                        writer,
+                        &mut writer,
                         &json!({
                             "type": "response",
                             "id": id,
@@ -112,30 +153,133 @@ impl MockSupervisor {
                     );
                 }
                 "get_session_stats" => {
-                    write_json(writer, &session_stats_response(id));
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "get_session_stats",
+                            "success": true,
+                            "data": {
+                                "contextUsage": { "tokens": 1200, "contextWindow": 200_000 },
+                                "cost": 0.01,
+                            },
+                        }),
+                    );
                 }
                 "detach" => {
-                    write_json(writer, &detach_response(id));
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": "detach",
+                            "success": true,
+                        }),
+                    );
                 }
-                _ => return false,
+                _ => {
+                    write_json(
+                        &mut writer,
+                        &json!({
+                            "type": "response",
+                            "id": id,
+                            "command": command_type,
+                            "success": true,
+                            "data": {},
+                        }),
+                    );
+                }
             }
-            true
-        });
+        }
     }
+}
+
+fn write_json(writer: &mut UnixStream, value: &Value) {
+    let mut line = serde_json::to_string(value).expect("serialize mock frame");
+    line.push('\n');
+    writer.write_all(line.as_bytes()).expect("write mock frame");
+    writer.flush().expect("flush mock frame");
 }
 
 /// The slim attach result: one session with an actively pursued goal, so every dock group except
 /// Subagents is selectable.
 fn attach_data(id: &str) -> Value {
-    let mut response = attach_response(id, "dock exit focus session");
-    response["data"]["snapshot"]["state"]["goal"] = json!({
-        "active": true,
-        "status": "active",
-        "goalId": "goal-1",
-        "objective": "land the dock exit focus",
-        "timeUsedSeconds": 0,
-    });
-    response
+    json!({
+        "type": "response",
+        "id": id,
+        "command": "attach",
+        "success": true,
+        "data": {
+            "protocol": { "name": "prime-agent.daemon", "version": 7 },
+            "activeSessionId": "s1",
+            "snapshot": {
+                "activeSessionId": "s1",
+                "summary": { "id": "s1", "cwd": "/tmp" },
+                "state": {
+                    "activeSessionId": "s1",
+                    "cwd": "/tmp",
+                    "sessionId": "sess-1",
+                    "sessionName": "dock exit focus session",
+                    "model": null,
+                    "isStreaming": false,
+                    "isCompacting": false,
+                    "sessionActions": { "queuedCount": 0, "steering": [], "followUps": [] },
+                    "goal": {
+                        "active": true,
+                        "status": "active",
+                        "goalId": "goal-1",
+                        "objective": "land the dock exit focus",
+                        "timeUsedSeconds": 0,
+                    },
+                },
+                "messages": [],
+                "lastEventSequence": 0,
+                "lastEventCursor": null,
+            },
+            "client": { "id": "mock", "capabilities": [] },
+            "lastEventSequence": 0,
+            "lastEventCursor": null,
+        },
+    })
+}
+
+fn options(socket: PathBuf) -> InteractiveOptions {
+    InteractiveOptions {
+        models: None,
+        socket_path: socket,
+        cwd: PathBuf::from("/tmp"),
+        session_dir: None,
+        script_path: None,
+        model_selection: ModelSelection::default(),
+        model_catalog: Vec::new(),
+        model_configured_providers: std::collections::HashSet::default(),
+        model_recent_models: Vec::new(),
+        default_thinking_level: None,
+        no_session: false,
+        session: SessionSelection::New,
+        initial_message: None,
+        show_images: true,
+        fullscreen_mouse: true,
+        theme: "prime".to_string(),
+        code_block_indent: "  ".to_string(),
+        tree_filter_mode: String::new(),
+        branch_summary_skip_prompt: false,
+        version: "0.0.0".to_string(),
+        onboarding: None,
+        telemetry_disabled: None,
+        client_auth: None,
+        traces: None,
+        provider_auth: None,
+        update_commands: None,
+        telemetry: None,
+        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
+        session_rlm_depth: None,
+        prompt_stash: std::sync::Arc::default(),
+        session_has_children: false,
+        restore_dock_focus: false,
+        client_settings: None,
+    }
 }
 
 fn run_plan(steps: Vec<HeadlessStep>) -> InteractiveOutcome {
@@ -431,7 +575,10 @@ fn agents_view_factory_panel_opens_on_the_run_list_and_returns() {
     });
     let outcome = run_plan_with(
         vec![wait_render("solo-spec"), key(KeyCode::Esc)],
-        Some(SessionPanel::FactoryRuns { row: None }),
+        Some(SessionPanel::FactoryRuns {
+            row: None,
+            node: None,
+        }),
         Some(graph),
     );
     assert!(
@@ -439,7 +586,7 @@ fn agents_view_factory_panel_opens_on_the_run_list_and_returns() {
             .frames
             .iter()
             .any(|frame| frame.contains("solo-spec") && frame.contains("open \u{b7}")),
-        "the factory page mounted on its run list"
+        "the machines page mounted on its run list"
     );
     assert!(
         outcome.return_to_agents_view,
