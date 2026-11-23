@@ -392,6 +392,7 @@ class BashHandle:
         self._reap_callback: Callable[[], None] | None = None
         self._result_consumed = False
         self._consumed_notice: Callable[[], None] | None = None
+        self._claude_completion: Callable[[int], dict[str, str]] | None = None
         self._callback_lock = threading.Lock()
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
         self._kill_lock = threading.Lock()
@@ -848,14 +849,19 @@ class BashHandle:
             if self._awaited_by_creating_cell or self._result_consumed or not repl.is_active():
                 return
             command = _capped(self.command)
-            reply = await repl.host_request(
-                {
-                    "type": "bash.completed",
-                    "pid": self._pid,
-                    "command": command,
-                    "exitCode": result.exit_code,
-                }
-            )
+            payload: dict[str, Any] = {"type": "bash.completed", "pid": self._pid,
+                                       "command": command, "exitCode": result.exit_code}
+            if self._claude_completion is not None:
+                try:
+                    worker = self._claude_completion(result.exit_code)
+                    payload["externalWorker"] = {"provider": "Claude Code", **{
+                        k: worker[k] for k in ("id", "name", "status", "preview", "model")
+                        if isinstance(worker.get(k), str)
+                    }}
+                except Exception:
+                    # Optional display metadata must never suppress the shell wake.
+                    pass
+            reply = await repl.host_request(payload)
             if isinstance(reply, dict) and reply.get("status") == "ok":
                 # Notice accepted by the host; later reads must ask it to withdraw.
                 self._arm_consumed_notice(command)
@@ -871,6 +877,10 @@ class BashHandle:
         finally:
             # Reap and deliver (or report rejection) before releasing kernel residency.
             repl.emit({"application/vnd.prime-agent.bash-activity+json": {**activity, "active": False}})
+
+    def set_claude_completion(self, describe: Callable[[int], dict[str, str]]) -> None:
+        """Describe the existing detached notice; never enqueue an additional one."""
+        self._claude_completion = describe
 
     def _arm_consumed_notice(self, command: str) -> None:
         # Armed only post-acceptance: the withdrawal can never overtake its notice.

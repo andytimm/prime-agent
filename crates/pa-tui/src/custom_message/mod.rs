@@ -107,7 +107,8 @@ pub struct AgentMessageRow {
 pub struct ShellCompletionRow {
     pub pid: Option<i64>,
     pub exit_code: Option<i64>,
-    /// Raw content (`[bash-done pid:N exit:M] ...`).
+    pub worker_header: Option<(String, ThemeColor)>,
+    /// Expanded text: shell output, or the Claude preview when available.
     pub content: String,
 }
 
@@ -397,14 +398,38 @@ fn shell_completion_row(message: &Value, details: &Value) -> ShellCompletionRow 
         && pid.is_some_and(|pid| pid > 0)
         && command.is_some()
         && exit_code.is_some();
-    if valid {
+    let worker = &details["externalWorker"];
+    let status = match worker["status"].as_str() {
+        Some("ready") => Some(("ready", "✓", ThemeColor::Muted)),
+        Some("blocked") => Some(("blocked", "!", ThemeColor::Warning)),
+        Some("failed") => Some(("failed", "✗", ThemeColor::Error)),
+        _ => None,
+    };
+    if let (Some("Claude Code"), Some(_), Some(name), Some((status, mark, color))) = (
+        worker["provider"].as_str(),
+        worker["id"].as_str().filter(|s| !s.trim().is_empty()),
+        worker["name"].as_str().filter(|s| !s.trim().is_empty()),
+        status,
+    ) {
         ShellCompletionRow {
+            worker_header: Some((format!("{mark} Claude Code · {name} · {status}"), color)),
+            pid,
+            exit_code,
+            content: worker["preview"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map_or_else(|| custom_content_text(message), str::to_owned),
+        }
+    } else if valid {
+        ShellCompletionRow {
+            worker_header: None,
             pid,
             exit_code,
             content: custom_content_text(message),
         }
     } else {
         ShellCompletionRow {
+            worker_header: None,
             pid: None,
             exit_code: None,
             content: match message.get("content") {
@@ -870,6 +895,7 @@ mod tests {
             body: Some(body.clone()),
         };
         let shell = ShellCompletionRow {
+            worker_header: None,
             pid: None,
             exit_code: Some(0),
             content: body.clone(),

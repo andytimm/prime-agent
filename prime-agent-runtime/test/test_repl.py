@@ -1216,6 +1216,27 @@ class ReplTest(unittest.TestCase):
         inspected = self.repl.execute("bash-inspect", "handle.poll().output")
         self.assertIn("detached", one(inspected, "result")["text"])
 
+    def test_claude_callback_decorates_existing_completion(self):
+        started = self.repl.execute(
+            "claude-detached", "from rlm import bash\nh = bash('exit 3')\n"
+            "h.set_claude_completion(lambda code: {'id':'test','status':str(code),'secret':'omit'})",
+        )
+        request = wait_for_host_request(self.repl, started)
+        self.assertEqual(request["data"]["type"], "bash.completed")
+        self.assertEqual(request["data"]["externalWorker"],
+                         {"provider": "Claude Code", "id": "test", "status": "3"})
+        reply_ok(self.repl, request)
+
+    def test_failed_claude_callback_keeps_shell_notice(self):
+        started = self.repl.execute(
+            "claude-missing", "from rlm import bash\nh = bash('exit 0')\n"
+            "h.set_claude_completion(lambda _: 1 / 0)",
+        )
+        request = wait_for_host_request(self.repl, started)
+        self.assertEqual(request["data"]["type"], "bash.completed")
+        self.assertNotIn("externalWorker", request["data"])
+        reply_ok(self.repl, request)
+
     def test_degraded_await_in_creating_cell_still_sends_bash_completion(self):
         # A bounded await that degrades inside the creating cell must count as
         # neither awaited nor consumed, or the [bash-done] notice (the only

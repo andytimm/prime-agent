@@ -122,11 +122,66 @@ fn validate_completion(data: &Value) -> anyhow::Result<KernelNotice> {
         .get("exitCode")
         .and_then(Value::as_i64)
         .ok_or_else(|| anyhow::anyhow!("bash.completed exitCode must be an integer"))?;
-    Ok(KernelNotice::bash_completion(
-        consumed.pid,
-        &consumed.command,
-        exit_code,
-    ))
+    let mut notice = KernelNotice::bash_completion(consumed.pid, &consumed.command, exit_code);
+    if let Some(worker) = data.get("externalWorker") {
+        decorate_claude_notice(&mut notice, worker, exit_code);
+    }
+    Ok(notice)
+}
+
+/// Keep the existing custom type and pid+command key for queue withdrawal/recovery.
+/// Missing or malformed optional metadata leaves the ordinary shell notice intact.
+fn decorate_claude_notice(notice: &mut KernelNotice, worker: &Value, exit_code: i64) {
+    if worker["provider"] != "Claude Code" {
+        return;
+    }
+    let Some(id) = worker["id"]
+        .as_str()
+        .and_then(|v| uuid::Uuid::parse_str(v).ok())
+    else {
+        return;
+    };
+    let Some(mut status @ ("ready" | "failed" | "blocked")) = worker["status"].as_str() else {
+        return;
+    };
+    if exit_code != 0 {
+        status = "failed";
+    }
+    let field = |key: &str, limit| {
+        let clean: String = worker[key]
+            .as_str()?
+            .chars()
+            .take(limit)
+            .map(|c| {
+                if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let clean = clean.trim();
+        (!clean.is_empty()).then(|| clean.to_owned())
+    };
+    let name = field("name", 80).unwrap_or_else(|| "Claude Code".to_owned());
+    let mut details = serde_json::json!({"provider": "Claude Code", "id": id.to_string(), "name": name, "status": status});
+    let mut content = format!("[external-worker] Claude Code · {name} · {status}\nJob: {id}");
+    if let Some(model) = field("model", 128) {
+        content.push_str(&format!("\nModel: {model}"));
+        details["model"] = Value::String(model);
+    }
+    if let Some(preview) = field("preview", 320) {
+        content.push_str(&format!("\nPreview: {preview}"));
+        details["preview"] = Value::String(preview);
+    }
+    notice.preview_label = "Claude Code";
+    notice.row.content = pa_types::ai::UserContent::Text(content);
+    notice
+        .row
+        .details
+        .as_mut()
+        .expect("shell completion details")["externalWorker"] = details;
 }
 
 /// TS `createAsyncBashConsumedHostHandler` validation: a positive integer pid and a
@@ -346,6 +401,54 @@ mod tests {
             "the row carries the notice header: {}",
             custom.payload
         );
+    }
+
+    #[tokio::test]
+    async fn claude_metadata_replaces_notice_at_the_same_wake_and_withdrawal_key() {
+        let (agent, _slot, wakes, handlers) = wired_agent();
+        let mut payload = completed_payload(4321, "worker command", 0);
+        let id = uuid::Uuid::new_v4().to_string();
+        payload["externalWorker"] = serde_json::json!({"provider":"Claude Code", "id":id,
+            "name":"review\npatch", "model":"actual", "status":"blocked", "preview":"é".repeat(400)});
+        let decorated = validate_completion(&payload).unwrap();
+        let details = decorated.row.details.unwrap();
+        assert_eq!(
+            details["externalWorker"]["preview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            320
+        );
+        let pa_types::ai::UserContent::Text(body) = decorated.row.content else {
+            panic!()
+        };
+        for fragment in [&id[..], "review patch", "blocked", "actual"] {
+            assert!(body.contains(fragment));
+        }
+        assert!(!body.contains("worker command"));
+        dispatch(handlers.get("bash.completed").unwrap(), payload.clone())
+            .await
+            .unwrap();
+        assert!(agent.has_queued_messages());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        dispatch(handlers.get("bash.consumed").unwrap(), payload.clone())
+            .await
+            .unwrap();
+        assert!(!agent.has_queued_messages());
+        payload["exitCode"] = 1.into();
+        assert_eq!(
+            validate_completion(&payload).unwrap().row.details.unwrap()["externalWorker"]["status"],
+            "failed"
+        );
+        payload["externalWorker"]["provider"] = "other".into();
+        assert!(validate_completion(&payload)
+            .unwrap()
+            .row
+            .details
+            .unwrap()
+            .get("externalWorker")
+            .is_none());
     }
 
     #[tokio::test]

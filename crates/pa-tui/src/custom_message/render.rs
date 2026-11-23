@@ -150,20 +150,21 @@ pub(crate) fn render_shell_completion(
     width: usize,
     leading: bool,
 ) -> Vec<Line> {
-    let failed = matches!(row.exit_code, Some(code) if code != 0);
-    let color = if failed {
-        theme.fg_style(ThemeColor::Error)
+    let (label, color) = if let Some((label, color)) = &row.worker_header {
+        (label.clone(), *color)
+    } else if let Some(code) = row.exit_code.filter(|code| *code != 0) {
+        (
+            format!("✗ Background shell command failed · exit {code}"),
+            ThemeColor::Error,
+        )
     } else {
-        theme.fg_style(ThemeColor::Muted)
+        (
+            "✓ Background shell command finished".to_owned(),
+            ThemeColor::Muted,
+        )
     };
-    let label = if let (Some(code), true) = (row.exit_code, failed) {
-        format!("Background shell command failed \u{b7} exit {code}")
-    } else {
-        "Background shell command finished".to_string()
-    };
-    let mark = if failed { "\u{2717}" } else { "\u{2713}" };
     let header = truncate_line(
-        &vec![Span::styled(format!(" {mark} {label}"), color)],
+        &vec![Span::styled(format!(" {label}"), theme.fg_style(color))],
         width,
         "",
     );
@@ -324,8 +325,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_shell_completion_collapses_to_named_status_and_expands_preview() {
+        for (status, mark) in [("ready", "✓"), ("blocked", "!"), ("failed", "✗")] {
+            let notice = serde_json::json!({
+                "customType": "async_bash_completion", "content": "Named completion notice",
+                "details": {"pid": 9, "command": "worker", "exitCode": 0, "externalWorker": {
+                    "provider": "Claude Code", "id": "run-1", "name": "review", "status": status,
+                    "preview": "Inspected the patch."
+                }}
+            });
+            let entries = super::super::custom_message_entries(&notice);
+            let [crate::chat::ChatEntry::ShellCompletion(row)] = entries.as_slice() else {
+                panic!("expected expandable completion row");
+            };
+            let header = format!(" {mark} Claude Code · review · {status}");
+            for detail in [Detail::Overview, Detail::All] {
+                let rows =
+                    render_shell_completion(row, detail, &theme(), 60, /*leading*/ false);
+                let lines: Vec<_> = rows
+                    .iter()
+                    .map(|line| flat(line).trim_end().to_owned())
+                    .collect();
+                let mut expected = vec![header.as_str()];
+                if detail == Detail::All {
+                    expected.push(" ╰─ Inspected the patch.");
+                }
+                assert_eq!(lines, expected);
+            }
+        }
+    }
+
+    #[test]
     fn shell_completion_rows() {
         let ok = ShellCompletionRow {
+            worker_header: None,
             pid: Some(4371),
             exit_code: Some(0),
             content: "[bash-done pid:4371 exit:0]".to_string(),
@@ -342,6 +375,7 @@ mod tests {
             "muted when exit 0"
         );
         let failed = ShellCompletionRow {
+            worker_header: None,
             pid: Some(11),
             exit_code: Some(2),
             content: "[bash-done pid:11 exit:2]".to_string(),
@@ -360,6 +394,7 @@ mod tests {
         // The expanded body is the raw content under the branch gutter: the gutter on
         // the first content row, the four-column continuation on the blank source line.
         let row = ShellCompletionRow {
+            worker_header: None,
             pid: Some(99),
             exit_code: Some(0),
             content: "[bash-done pid:99 exit:0]\n\nCommand: \"printf done\"".to_string(),
