@@ -1,0 +1,9 @@
+# External collaborator UI prototype
+
+This local experiment shows an external Claude Code job alongside the owning Prime session’s subagents. It does not register a daemon agent, allocate a model relay, or alter native agents. The row is read-only: send, redirect and cancel still go through the Claude skill. Claude retains the authoritative conversation and job state.
+
+For the local `claude-code` skill, pass `agents_view=True` to `start` from a **saved** Prime session. The main screen’s activity dock counts a running external job just like a running native subagent; it does not add a name or a separate badge. Open the normal Agents view and press Enter on the external job to inspect its recent exchange. The opt-in projects a bounded preview of prompt and result text into the private agent directory; pass `agents_view=False` to suppress this copy, even if the local preference enables previews by default.
+
+The experiment reads local snapshots from `external-collaborators/<durable owner session id>/<job UUID>.json` under the configured agent directory. Writers publish atomically. A snapshot carries version, job and owner IDs, a label, last reported activity/state, and a bounded recent message exchange with direction and delivery states. It does not contain a command, a path to read, or an action handler. Files are a prototype implementation detail, not an agent protocol or extension guarantee. The skill still supervises one native Claude session through Prime’s existing shell path.
+
+An upstream version should explore an ACP client backend for external conversations, mapped into Prime’s existing owner/subagent view. Keep Prime ownership and wakeups separate from the transport; use supported capability checks rather than assume every ACP agent can send, interrupt and resume identically. The goal of this prototype is to evaluate the user experience before designing the final integration.
