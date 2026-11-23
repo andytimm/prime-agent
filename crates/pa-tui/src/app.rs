@@ -38,12 +38,54 @@ impl Default for AppOptions {
 
 #[must_use]
 pub fn load_theme(name: &str) -> Theme {
+    let agent_dir = pa_types::platform::agent_dir();
+    load_theme_with_agent_dir(name, agent_dir.as_deref())
+}
+
+fn load_theme_with_agent_dir(name: &str, agent_dir: Option<&std::path::Path>) -> Theme {
     let mode = crate::theme::detect_color_mode();
-    // The default brand theme when the caller passes none (empty) or an
-    // unknown name; only known builtins resolve.
-    let known = ["prime", "dark", "light"];
-    let name = if known.contains(&name) { name } else { "prime" };
-    Theme::builtin(name, mode)
+    if ["prime", "dark", "light"].contains(&name) {
+        return Theme::builtin(name, mode);
+    }
+    let path = std::path::Path::new(name);
+    if let Ok(theme) = crate::theme::load_theme_from_path(path, mode) {
+        return theme;
+    }
+    if let Some(agent_dir) = agent_dir {
+        let path = agent_dir.join("themes").join(format!("{name}.json"));
+        if let Ok(theme) = crate::theme::load_theme_from_path(&path, mode) {
+            return theme;
+        }
+    }
+    Theme::builtin("prime", mode)
+}
+
+#[cfg(test)]
+mod theme_loading_tests {
+    use super::load_theme_with_agent_dir;
+
+    #[test]
+    fn loads_selected_custom_theme_by_name_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let themes = dir.path().join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let path = themes.join("custom.json");
+        std::fs::write(
+            &path,
+            r##"{"name":"custom","vars":{"pink":"#f92672"},"colors":{"accent":"pink"}}"##,
+        )
+        .unwrap();
+        let expected =
+            crate::theme::load_theme_from_path(&path, crate::theme::detect_color_mode()).unwrap();
+        assert_eq!(
+            load_theme_with_agent_dir("custom", Some(dir.path())),
+            expected
+        );
+        assert_eq!(
+            load_theme_with_agent_dir(path.to_str().unwrap(), None),
+            expected
+        );
+    }
 }
 
 /// Run the view against a session stream until the stream ends and the user exits. `on_submit`
