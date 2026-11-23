@@ -72,6 +72,8 @@ pub enum RowKind {
     FactoryRuns,
     /// One machine-wide persistent shell with its assigned session.
     PersistentShell,
+    /// A display-only snapshot owned by a Prime session, not a daemon session.
+    ExternalCollaborator,
 }
 
 /// The summary line's identity prefix (the `subagents:` prefix, so a carried selection
@@ -109,7 +111,8 @@ impl AgentsViewRow {
             | RowKind::Subagent
             | RowKind::Shells
             | RowKind::FactoryRuns
-            | RowKind::PersistentShell => true,
+            | RowKind::PersistentShell
+            | RowKind::ExternalCollaborator => true,
         }
     }
 }

@@ -69,6 +69,79 @@ fn mode_with_row(title: &str, model: &str) -> (AgentsViewMode, usize) {
     (mode, 1)
 }
 
+#[test]
+fn external_exchange_stays_with_its_owner_and_cannot_dispatch_native_actions() {
+    const OWNER: &str = "01998001-0000-7000-8000-000000000000";
+    const JOB: &str = "712e5055-707d-4d1b-b604-bb5df23499d1";
+    let root = tempfile::tempdir().unwrap();
+    let owner_dir = root.path().join(OWNER);
+    std::fs::create_dir(&owner_dir).unwrap();
+    let snapshot = serde_json::json!({
+        "version": 1,
+        "id": JOB,
+        "owner_session_id": OWNER,
+        "name": "review reader",
+        "provider": "Claude Code",
+        "status": "blocked",
+        "activity": "Needs the chosen branch",
+        "updated_at": 2.5,
+        "messages": [
+            {"direction": "to_external", "text": "Inspect the diff", "status": "submitted"},
+            {"direction": "from_external", "text": "Which branch?\u{001b}", "status": "answered"},
+        ],
+        "activeSessionId": "ignore-this",
+        "rlmChildId": "ignore-this-too",
+    });
+    std::fs::write(owner_dir.join(format!("{JOB}.json")), snapshot.to_string()).unwrap();
+    // The fixture's content must not make it authoritative at any other path.
+    std::fs::write(
+        owner_dir.join("26d86686-f2f0-4823-af2e-55aa522c6c05.json"),
+        snapshot.to_string(),
+    )
+    .unwrap();
+
+    let mut mode = mode_with_anchor(
+        None,
+        vec![roster_entry("parent", "idle", &parent_summary(OWNER))],
+    );
+    assert_eq!(mode.external_owners(), vec![OWNER]);
+    mode.external_snapshots =
+        crate::external_collaborators::read_snapshots(root.path(), mode.external_owners());
+    mode.rebuild_rows();
+    let [parent, external] = mode.rows.as_slice() else {
+        panic!("expected owner and one collaborator")
+    };
+    assert_eq!(external.kind, RowKind::ExternalCollaborator);
+    assert_eq!(external.parent_identity.as_ref(), Some(&parent.identity));
+    assert!(external.summary.is_null());
+    mode.selected = 1;
+    mode.handle_key("ctrl+x");
+    mode.handle_key("ctrl+x");
+    assert!(mode.take_delete_action().is_none());
+    assert!(mode.reply_target().is_none());
+    assert!(mode.rename_target().is_none());
+
+    mode.options.scope = Some(AgentsViewScope {
+        session_id: Some(OWNER.to_string()),
+        active_session_id: None,
+        session_name: Some("Parent".to_string()),
+    });
+    mode.rebuild_rows();
+    assert_eq!(mode.rows.len(), 1);
+    assert_eq!(mode.rows[0].depth, 0);
+    let text = |lines: &[Line]| lines.iter().map(flat).collect::<Vec<_>>().join("\n");
+    let rendered = text(&mode.render_frame(96, 26).0);
+    assert!(rendered.contains("last reported: blocked"));
+    mode.handle_key("enter");
+    let rendered = text(&mode.render_frame(96, 20).0);
+    assert!(rendered.contains("Prime · submitted\nInspect the diff"));
+    assert!(rendered.contains("Claude Code · answered\nWhich branch?"));
+    assert!(!rendered.contains('\u{001b}'));
+    mode.handle_key("escape");
+    assert!(mode.external_exchange.is_none());
+    assert!(mode.running);
+}
+
 fn flat(line: &Line) -> String {
     line.iter().map(|s| s.content.as_str()).collect()
 }

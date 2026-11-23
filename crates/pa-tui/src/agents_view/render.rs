@@ -15,6 +15,11 @@ impl AgentsViewMode {
     ) -> (Vec<Line>, Option<(usize, usize)>) {
         // The frame height feeds the page step (TS reads `ui.terminal.rows` live at key time).
         self.last_height = height;
+        if let Some(lines) = self.render_exchange(width, height) {
+            self.click_rows.clear();
+            self.hover_row = None;
+            return (lines, None);
+        }
         if let Some(view) = self.shell_view.as_mut() {
             view.set_viewport_rows(height);
             self.click_rows.clear();
@@ -340,6 +345,13 @@ impl AgentsViewMode {
                         .map(|(index, row)| DisplayItem::Row(index, row)),
                 );
             }
+            display.extend(
+                self.rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.kind == RowKind::ExternalCollaborator && row.depth == 0)
+                    .map(|(index, row)| DisplayItem::Row(index, row)),
+            );
             for (section, count) in &counts {
                 if *count == 0 {
                     continue;
@@ -527,6 +539,11 @@ impl AgentsViewMode {
         }
         let selected = Some(row.identity.as_str())
             == self.rows.get(self.selected).map(|r| r.identity.as_str());
+        if row.kind == RowKind::ExternalCollaborator {
+            let text = format!("{}◇ {}", depth_indent(row.depth), row.title);
+            let line = pad_line(vec![crate::Span::raw(truncate_text(&text, width))], width);
+            return finish_session_row(theme, line, selected, hovered, width);
+        }
         // The activity lines' glyph sits in the summary line's marker slot; no cost cell.
         if matches!(row.kind, RowKind::Shells | RowKind::FactoryRuns) {
             let text = format!("{}{}", depth_indent(row.depth), row.title);
@@ -808,6 +825,7 @@ impl AgentsViewMode {
                     "expand"
                 }
             }
+            Some(row) if row.kind == RowKind::ExternalCollaborator => "view exchange",
             _ => "open",
         };
         // The bar lists every effective action key, so a merged binding can never ship without

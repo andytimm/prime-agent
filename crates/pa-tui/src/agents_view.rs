@@ -41,6 +41,8 @@ mod render;
 use render::cell;
 use render::Renderer;
 
+mod external_collaborators;
+
 mod delete;
 mod heartbeats;
 mod persistent_shells;
@@ -485,6 +487,8 @@ struct AgentsViewMode {
     pending_shell_open: Option<String>,
     /// The activity polls' counts behind the shells and factory-run lines.
     session_activity: ActivityCounts,
+    external_snapshots: crate::external_collaborators::Snapshots,
+    external_exchange: Option<external_collaborators::Exchange>,
 }
 
 /// The press state of one left click, row-scoped: the release must land on the same row.
@@ -566,6 +570,8 @@ impl AgentsViewMode {
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
             pulse: 0,
+            external_snapshots: Default::default(),
+            external_exchange: None,
             running: true,
             scope_popped: false,
             scope_back: false,
@@ -863,6 +869,13 @@ async fn run_agents_view_surface(
     }
     let mut pending: Vec<UiInput> = Vec::new();
     let mut last_pulse = tokio::time::Instant::now();
+    let external_root =
+        pa_types::platform::agent_dir().map(|dir| dir.join("external-collaborators"));
+    let mut external_poll = tokio::time::interval(Duration::from_secs(2));
+    external_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut external_fetch: Option<
+        tokio::task::JoinHandle<crate::external_collaborators::Snapshots>,
+    > = None;
     // The incident-notice poll: re-read appended agent.jsonl bytes, re-rendered only on a changed
     // collapsed line.
     let mut incident_poll_at = tokio::time::Instant::now()
@@ -1251,6 +1264,29 @@ async fn run_agents_view_surface(
                     }
                     // The incident-notice poll's wake-up: the drain below the select
                     // does the refresh, so the arm only ends the wait.
+                    _ = external_poll.tick(), if external_root.is_some() && external_fetch.is_none() => {
+                        if let Some(root) = external_root.clone() {
+                            let owners = mode.external_owners();
+                            external_fetch = Some(tokio::task::spawn_blocking(move || {
+                                crate::external_collaborators::read_snapshots(&root, owners)
+                            }));
+                        }
+                    }
+                    result = async {
+                        match external_fetch.as_mut() {
+                            Some(fetch) => fetch.await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        external_fetch = None;
+                        if let Ok(snapshots) = result {
+                            if snapshots != mode.external_snapshots {
+                                mode.external_snapshots = snapshots;
+                                mode.rebuild_rows();
+                                redraw = true;
+                            }
+                        }
+                    }
                     () = tokio::time::sleep_until(incident_poll_at) => {}
                     // The render barrier's deadline: an armed hold whose needle never lands
                     // still pops here, so a quiet daemon cannot wedge the loop.

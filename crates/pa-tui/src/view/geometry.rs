@@ -354,6 +354,7 @@ mod tests {
             )
                 .prop_map(|(pid, exit_code, content)| {
                     ChatEntry::ShellCompletion(Box::new(ShellCompletionRow {
+                        worker_header: None,
                         pid,
                         exit_code,
                         content,

@@ -130,11 +130,12 @@ impl SessionUi {
         // idle and dead registry rows (passivated children the ledger
         // still seeds) never bloat the collapsed indicator — the expanded
         // row breaks them out.
+        let external = &self.external_subagent_counts;
         crate::chrome::ActivityDock {
-            subagents_running_direct: self.subagent_counts.running_direct,
+            subagents_running_direct: self.subagent_counts.running_direct + external.running,
             subagents_running_nested: self.subagent_counts.running_nested,
-            subagents_idle: self.subagent_counts.idle,
-            subagents_inactive: self.subagent_counts.inactive,
+            subagents_idle: self.subagent_counts.idle + external.idle,
+            subagents_inactive: self.subagent_counts.inactive + external.inactive,
             heartbeats: self.heartbeat_catalog.len(),
             heartbeats_active: crate::heartbeats_picker::dock_heartbeat_items(
                 &self.heartbeat_catalog,
@@ -388,6 +389,17 @@ impl SessionUi {
         }
         self.dirty = true;
         Ok(())
+    }
+
+    pub(crate) fn apply_external_subagents(
+        &mut self,
+        counts: crate::external_collaborators::DockCounts,
+        view: &mut AgentView,
+    ) {
+        if counts != self.external_subagent_counts {
+            self.external_subagent_counts = counts;
+            self.sync_activity_dock(view);
+        }
     }
 
     /// The expanded dock's heartbeat countdowns ride the run loop's 2s bash-activity poll (the

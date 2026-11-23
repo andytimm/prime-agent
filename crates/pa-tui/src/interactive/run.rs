@@ -815,6 +815,13 @@ async fn run_interactive_surface(
 
     // `pending` rides in from the opening phase: typed-ahead inputs
     // queued behind the open dispatch first, in order.
+    let external_root =
+        pa_types::platform::agent_dir().map(|root| root.join("external-collaborators"));
+    let mut external_poll = tokio::time::interval(ACTIVITY_POLL_INTERVAL);
+    external_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut external_fetch: Option<
+        tokio::task::JoinHandle<(String, crate::external_collaborators::DockCounts)>,
+    > = None;
     let mut last_bash_refresh = Instant::now();
     let mut last_factory_refresh = Instant::now();
     // The enhanced-key modes settle once (kitty answer or fallback) and
@@ -1660,6 +1667,30 @@ async fn run_interactive_surface(
                 quiet_tick_deadline = None;
                 session.materialize_editor_autocomplete(&mut view);
                 session.selection_auto_scroll_tick(&mut view);
+            }
+            _ = external_poll.tick(), if external_fetch.is_none() && external_root.is_some() && !session.session_id.is_empty() => {
+                if let Some(root) = external_root.clone() {
+                    let owner = session.session_id.clone();
+                    external_fetch = Some(tokio::task::spawn_blocking(move || {
+                        let now = crate::agents_view_state::now_ms() as f64 / 1000.0;
+                        let counts = crate::external_collaborators::read_dock_counts(&root, &owner, now);
+                        (owner, counts)
+                    }));
+                }
+            }
+            external_result = async {
+                match external_fetch.as_mut() {
+                    Some(fetch) => fetch.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                external_fetch = None;
+                if let Some((_, counts)) = external_result
+                    .ok()
+                    .filter(|(owner, _)| owner == &session.session_id)
+                {
+                    session.apply_external_subagents(counts, &mut view);
+                }
             }
             () = async {
                 // The 2s bash-activity poll, on its own absolute deadline and only on daemons that

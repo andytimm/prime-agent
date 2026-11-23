@@ -139,6 +139,7 @@ impl AgentsViewMode {
         if !scope_active && self.query.trim().is_empty() {
             rows.splice(0..0, self.persistent_shell_rows(&records));
         }
+        let rows = self.external_rows(rows);
         // Keep the selection on the same row across rebuilds, falling back to the carried
         // identity/key.
         self.selected = resolve_selection(
@@ -490,6 +491,9 @@ impl AgentsViewMode {
         // A sticky line clears on any keypress (the transient lines ride their own
         // expiry).
         self.clear_sticky_status();
+        if self.handle_exchange_key(key) {
+            return;
+        }
         if self.shell_view.is_some() {
             self.handle_shell_view_key(key);
             return;
@@ -745,6 +749,9 @@ impl AgentsViewMode {
     /// would submit per line): the armed composer's editor takes it; the search field
     /// ignores it.
     pub(super) fn handle_paste(&mut self, text: &str) {
+        if self.external_exchange.is_some() {
+            return;
+        }
         match std::mem::replace(&mut self.composer, Composer::Search) {
             Composer::Search => {}
             Composer::Rename(mut rename) => {
@@ -769,6 +776,12 @@ impl AgentsViewMode {
     /// selection-centered, not scroll-driven).
     pub(super) fn handle_mouse(&mut self, event: &crate::mouse::MouseEvent) {
         if !crate::mouse_tracking::active() {
+            return;
+        }
+        if self.external_exchange.is_some() {
+            if let Some(delta) = crate::mouse::wheel_scroll_delta(event) {
+                self.scroll_exchange(delta as isize);
+            }
             return;
         }
         if let Some(view) = self.shell_view.as_mut() {

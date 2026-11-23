@@ -336,6 +336,7 @@ pub(crate) struct SessionUi {
     subagents_focused: bool,
     activity_group: crate::chrome::ActivityGroup,
     subagent_counts: crate::subagents::SubagentCounts,
+    external_subagent_counts: crate::external_collaborators::DockCounts,
     /// This session's persisted file path (family identity of the
     /// subagent linkage; `None` for unpersisted sessions).
     session_file: Option<String>,

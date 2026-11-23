@@ -61,6 +61,7 @@ pub mod error_summary;
 pub mod exit_guard;
 pub(crate) mod exit_restore;
 pub mod export_share;
+pub(crate) mod external_collaborators;
 mod external_editor;
 pub mod factory_view;
 pub mod fuzzy;

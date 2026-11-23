@@ -158,6 +158,7 @@ impl SessionUi {
             subagents_focused: false,
             activity_group: crate::chrome::ActivityGroup::Subagents,
             subagent_counts: crate::subagents::SubagentCounts::default(),
+            external_subagent_counts: Default::default(),
             session_file: None,
             pending_selection: None,
             pending_selection_rlm_depth: None,
@@ -420,6 +421,9 @@ impl SessionUi {
                     },
                 )
                 .await;
+        }
+        if self.session_id != reconstructed.session_id {
+            self.external_subagent_counts = Default::default();
         }
         self.session_id = reconstructed.session_id;
         self.attach_event_generation
